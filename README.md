@@ -24,8 +24,7 @@ Lidarr YouTube Downloader is a lightweight web application that:
 - 🔍 Automatically fetches your missing albums from Lidarr
 - 🎬 Searches and downloads them from YouTube
 - 🎧 Converts to high-quality MP3 with proper ID3 tags
-- 📂 Auto-imports them back into Lidarr
-
+- 
 **No torrents. No Usenet. Just YouTube and your music library.**
 
 ---
