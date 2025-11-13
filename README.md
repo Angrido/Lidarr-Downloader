@@ -12,6 +12,19 @@ It automatically fetches your "Missing" albums list from Lidarr, allows you to d
 
 ---
 
+## 📸 Screenshots
+
+<p align="center">
+  <a href="https://i.imgur.com/MC8X1qP.png">
+    <img src="https://i.imgur.com/MC8X1qP.png" width="45%">
+  </a>
+  <a href="https://i.imgur.com/mGs2pqV.png">
+    <img src="https://i.imgur.com/mGs2pqV.png" width="45%">
+  </a>
+</p>
+
+---
+
 ## ✨ Key Features
 
 - 🕵️ **Seamless Integration:** Connects to your Lidarr API to find missing albums instantly.
@@ -36,7 +49,7 @@ It automatically fetches your "Missing" albums list from Lidarr, allows you to d
 |:---|:---|
 | **Docker Image** | `angrido/lidarr-downloader:latest` |
 | **Title** | `Lidarr Downloader` |
-| **Icon URL** | `https://raw.githubusercontent.com/Lidarr/Lidarr/develop/Logo/lidarr.png` |
+| **Icon URL** | `https://cdn-icons-png.flaticon.com/512/1895/1895657.png` |
 | **WebUI Port** | `5000` |
 
 4. **Ports Configuration:**
