@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metadata Manager - Lidarr YT</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #0f0f0f;
+            --card-bg: #1a1a1a;
+            --text: #e0e0e0;
+            --text-dim: #a0a0a0;
+            --primary: #1db954;
+            --primary-hover: #1ed760;
+            --border: #2a2a2a;
+        }
+        body.light {
+            --bg: #f5f5f5;
+            --card-bg: #ffffff;
+            --text: #1a1a1a;
+            --text-dim: #666666;
+            --border: #e0e0e0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        header {
+            background: var(--card-bg);
+            padding: 1rem 2rem;
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        h1 { font-size: 1.5rem; font-weight: 600; }
+        nav { display: flex; gap: 1rem; align-items: center; }
+        nav a {
+            color: var(--text);
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            transition: background 0.2s;
+        }
+        nav a:hover { background: var(--border); }
+        .toggle {
+            width: 50px;
+            height: 26px;
+            background: var(--border);
+            border-radius: 13px;
+            position: relative;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .toggle.active { background: var(--primary); }
+        .toggle::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            background: white;
+            border-radius: 50%;
+            top: 3px;
+            left: 3px;
+            transition: left 0.3s;
+        }
+        .toggle.active::after { left: 27px; }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        .artist-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .artist-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .artist-name {
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+        .album-list {
+            display: grid;
+            gap: 0.75rem;
+            margin-left: 1rem;
+        }
+        .album-item {
+            background: var(--bg);
+            padding: 1rem;
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        button {
+            padding: 0.5rem 1rem;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        button:hover { background: var(--primary-hover); }
+        button:disabled {
+            background: var(--border);
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+        .status-pending {
+            background: #ff9800;
+            color: white;
+        }
+        .status-complete {
+            background: var(--primary);
+            color: white;
+        }
+        @media (max-width: 768px) {
+            header {
+                flex-direction: column;
+                gap: 1rem;
+            }
+            .artist-header, .album-item {
+                flex-direction: column;
+                gap: 0.5rem;
+                align-items: flex-start;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🎨 Metadata Manager</h1>
+        <nav>
+            <a href="/">Dashboard</a>
+            <a href="/metadata">Metadata</a>
+            <a href="/scheduler">Scheduler</a>
+            <div class="toggle" id="themeToggle"></div>
+        </nav>
+    </header>
+
+    <div class="container">
+        <div style="background: var(--card-bg); padding: 1.5rem; border-radius: 8px; margin-bottom: 2rem; border: 1px solid var(--border);">
+            <h2 style="margin-bottom: 0.5rem;">Download Extra Assets</h2>
+            <p style="color: var(--text-dim); margin-bottom: 1rem;">
+                Download logo, fanart, banner, and poster images for your artists. Creates artist.nfo files.
+            </p>
+            <button onclick="loadArtists()">Scan Library</button>
+        </div>
+
+        <div id="artistList"></div>
+    </div>
+
+    <script>
+        const themeToggle = document.getElementById('themeToggle');
+        const savedTheme = localStorage.getItem('theme') || 'dark';
+        if (savedTheme === 'light') {
+            document.body.classList.add('light');
+            themeToggle.classList.add('active');
+        }
+
+        themeToggle.addEventListener('click', () => {
+            document.body.classList.toggle('light');
+            themeToggle.classList.toggle('active');
+            localStorage.setItem('theme', document.body.classList.contains('light') ? 'light' : 'dark');
+        });
+
+        async function loadArtists() {
+            const list = document.getElementById('artistList');
+            list.innerHTML = '<p>Scanning library...</p>';
+
+            const res = await fetch('/api/artists');
+            const artists = await res.json();
+
+            if (artists.length === 0) {
+                list.innerHTML = '<p style="text-align: center; padding: 2rem;">No artists found. Download some albums first!</p>';
+                return;
+            }
+
+            list.innerHTML = artists.map(artist => `
+                <div class="artist-card">
+                    <div class="artist-header">
+                        <div class="artist-name">${artist.name}</div>
+                        <button onclick="downloadArtistMetadata('${artist.name}', '${artist.albums[0].path}')">
+                            Download Assets
+                        </button>
+                    </div>
+                    <div class="album-list">
+                        ${artist.albums.map(album => `
+                            <div class="album-item">
+                                <span>${album.name}</span>
+                                <button onclick="downloadAlbumMetadata('${artist.name}', '${album.path}')">
+                                    Download
+                                </button>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function downloadArtistMetadata(artist, path) {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+
+            const parentPath = path.substring(0, path.lastIndexOf('/'));
+
+            await fetch('/api/metadata/download', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ artist, path: parentPath })
+            });
+
+            btn.textContent = 'Complete!';
+            setTimeout(() => {
+                btn.disabled = false;
+                btn.textContent = 'Download Assets';
+            }, 2000);
+        }
+
+        async function downloadAlbumMetadata(artist, path) {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+
+            await fetch('/api/metadata/download', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ artist, path })
+            });
+
+            btn.textContent = 'Complete!';
+            setTimeout(() => {
+                btn.disabled = false;
+                btn.textContent = 'Download';
+            }, 2000);
+        }
+    </script>
+</body>
+</html>
