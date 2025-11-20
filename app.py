@@ -3,21 +3,20 @@ import json
 import time
 import threading
 import shutil
+import re
 from pathlib import Path
-from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_from_directory
 import requests
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TDRC, TRCK, APIC, TXXX, UFID
 import yt_dlp
 import schedule
-from bing_image_downloader import downloader
 
 app = Flask(__name__)
 
 CONFIG_FILE = '/config/config.json'
 DOWNLOAD_DIR = '/downloads'
-download_process = {'active': False, 'stop': False, 'progress': {}}
+download_process = {'active': False, 'stop': False, 'progress': {}, 'album_id': None}
 
 def load_config():
     config = {
@@ -29,7 +28,6 @@ def load_config():
         'telegram_bot_token': os.getenv('TELEGRAM_BOT_TOKEN', ''),
         'telegram_chat_id': os.getenv('TELEGRAM_CHAT_ID', '')
     }
-    
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
@@ -39,7 +37,6 @@ def load_config():
                         config[key] = file_config[key]
         except:
             pass
-    
     return config
 
 def save_config(config):
@@ -72,50 +69,43 @@ def lidarr_request(endpoint, method='GET', data=None):
 
 def get_missing_albums():
     try:
-        print("DEBUG: Calling wanted/missing endpoint...")
-        wanted = lidarr_request('wanted/missing?pageSize=500&sortKey=releaseDate&sortDirection=descending&includeArtist=true')
-        
+        wanted = lidarr_request('wanted/missing?pageSize=1000&sortKey=releaseDate&sortDirection=descending&includeArtist=true')
         if isinstance(wanted, dict) and 'records' in wanted:
             records = wanted.get('records', [])
-            print(f"DEBUG: Found {len(records)} missing albums")
-            
-            if len(records) == 0:
-                return []
-            
-            for idx, album in enumerate(records):
-                statistics = album.get('statistics', {})
-                track_count = statistics.get('trackCount', 0)
-                track_file_count = statistics.get('trackFileCount', 0)
-                missing_count = track_count - track_file_count
-                
-                album['missingTrackCount'] = missing_count
-                
-                if idx < 3:
-                    print(f"DEBUG: '{album.get('title')}' - Total: {track_count}, Files: {track_file_count}, Missing: {missing_count}")
-            
-            print(f"DEBUG: Returning {len(records)} albums")
+            for album in records:
+                stats = album.get('statistics', {})
+                total = stats.get('trackCount', 0)
+                files = stats.get('trackFileCount', 0)
+                album['missingTrackCount'] = total - files
             return records
-        else:
-            print("DEBUG: wanted/missing failed")
-            return []
-            
-    except Exception as e:
-        print(f"DEBUG: Exception: {e}")
-        import traceback
-        traceback.print_exc()
+        return []
+    except:
         return []
 
-def get_itunes_preview(artist, track):
+def get_itunes_tracks(artist, album_name):
     try:
         url = 'https://itunes.apple.com/search'
-        params = {'term': f"{artist} {track}", 'media': 'music', 'limit': 1}
+        params = {'term': f"{artist} {album_name}", 'entity': 'album', 'limit': 1}
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
         if data.get('resultCount', 0) > 0:
-            return data['results'][0].get('previewUrl')
+            collection_id = data['results'][0]['collectionId']
+            lookup_url = 'https://itunes.apple.com/lookup'
+            lookup_params = {'id': collection_id, 'entity': 'song'}
+            lookup_r = requests.get(lookup_url, params=lookup_params, timeout=10)
+            lookup_data = lookup_r.json()
+            tracks = []
+            for item in lookup_data.get('results', [])[1:]:
+                tracks.append({
+                    'trackNumber': item.get('trackNumber'),
+                    'title': item.get('trackName'),
+                    'previewUrl': item.get('previewUrl'),
+                    'hasFile': False 
+                })
+            return tracks
     except:
         pass
-    return None
+    return []
 
 def get_itunes_artwork(artist, album):
     try:
@@ -125,28 +115,61 @@ def get_itunes_artwork(artist, album):
         data = r.json()
         if data.get('resultCount', 0) > 0:
             artwork_url = data['results'][0].get('artworkUrl100', '').replace('100x100', '3000x3000')
-            if artwork_url:
-                img_data = requests.get(artwork_url, timeout=15).content
-                return img_data
+            return requests.get(artwork_url, timeout=15).content
     except:
         pass
     return None
 
-def download_track_youtube(query, output_path):
-    ydl_opts = {
+def sanitize_filename(name):
+    name = re.sub(r'[<>:"/\\|?*]', '', name)
+    return name.strip()
+
+def download_track_youtube(query, output_path, track_title_original):
+    ydl_opts_search = {
         'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '320',
-        }],
-        'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
-        'progress_hooks': [lambda d: update_progress(d)]
+        'extract_flat': True,
+        'noplaylist': True
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([f"ytsearch1:{query}"])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts_search) as ydl:
+            search_results = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            video_url = None
+            forbidden_words = ['remix', 'cover', 'mashup', 'bootleg', 'live', 'dj mix']
+            
+            for entry in search_results.get('entries', []):
+                title = entry.get('title', '').lower()
+                is_clean = True
+                for word in forbidden_words:
+                    if word in title and word not in track_title_original.lower():
+                        is_clean = False
+                        break
+                if is_clean:
+                    video_url = entry['url']
+                    break
+            
+            if not video_url and search_results.get('entries'):
+                video_url = search_results['entries'][0]['url']
+
+            if video_url:
+                ydl_opts_download = {
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '320',
+                    }],
+                    'outtmpl': output_path,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'progress_hooks': [lambda d: update_progress(d)]
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_dl:
+                    ydl_dl.download([video_url])
+                    return True
+    except:
+        return False
 
 def update_progress(d):
     if d['status'] == 'downloading':
@@ -155,231 +178,192 @@ def update_progress(d):
             'speed': d.get('_speed_str', 'N/A').strip()
         }
 
+def set_permissions(path):
+    try:
+        if os.path.isdir(path):
+            os.chmod(path, 0o777)
+            for root, dirs, files in os.walk(path):
+                for d in dirs:
+                    os.chmod(os.path.join(root, d), 0o777)
+                for f in files:
+                    os.chmod(os.path.join(root, f), 0o666)
+        else:
+            os.chmod(path, 0o666)
+    except:
+        pass
+
 def tag_mp3(file_path, track_info, album_info, cover_data):
     try:
         try:
             audio = MP3(file_path, ID3=ID3)
-        except Exception:
+        except:
             audio = MP3(file_path)
             audio.add_tags()
-            
         if audio.tags is None:
             audio.add_tags()
-            
+
         audio.tags.add(TIT2(encoding=3, text=track_info['title']))
         audio.tags.add(TPE1(encoding=3, text=album_info['artist']['artistName']))
         audio.tags.add(TPE2(encoding=3, text=album_info['artist']['artistName']))
         audio.tags.add(TALB(encoding=3, text=album_info['title']))
         audio.tags.add(TDRC(encoding=3, text=str(album_info.get('releaseDate', '')[:4])))
-        audio.tags.add(TRCK(encoding=3, text=f"{track_info['trackNumber']}/{album_info['trackCount']}"))
+        audio.tags.add(TRCK(encoding=3, text=f"{track_info['trackNumber']}/{album_info.get('trackCount', 0)}"))
         
         if album_info.get('releases'):
             release = album_info['releases'][0]
-            audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Release Track Id', text=track_info.get('foreignRecordingId', '')))
-            audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Album Id', text=release.get('foreignReleaseId', '')))
-            audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Artist Id', text=album_info['artist'].get('foreignArtistId', '')))
-            audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Album Release Group Id', text=album_info.get('foreignAlbumId', '')))
-            audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Release Country', text=release.get('country', '')))
-            audio.tags.add(TXXX(encoding=3, desc='Media', text='Digital Media'))
-            if release.get('label'):
-                audio.tags.add(TXXX(encoding=3, desc='LABEL', text=','.join(release['label'])))
-            if release.get('barcode'):
-                audio.tags.add(TXXX(encoding=3, desc='BARCODE', text=release['barcode']))
-        
+            if track_info.get('foreignRecordingId'):
+                audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Release Track Id', text=track_info['foreignRecordingId']))
+            if release.get('foreignReleaseId'):
+                audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Album Id', text=release['foreignReleaseId']))
+            if album_info['artist'].get('foreignArtistId'):
+                audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Artist Id', text=album_info['artist']['foreignArtistId']))
+            if album_info.get('foreignAlbumId'):
+                audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Album Release Group Id', text=album_info['foreignAlbumId']))
+            if release.get('country'):
+                audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Release Country', text=release['country']))
+
         if track_info.get('foreignRecordingId'):
             audio.tags.add(UFID(owner='http://musicbrainz.org', data=track_info['foreignRecordingId'].encode()))
-        
         if cover_data:
             audio.tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=cover_data))
         
         audio.save(v2_version=3)
         return True
-    except Exception as e:
-        print(f"DEBUG: Tagging error: {e}")
+    except:
+        return False
+
+def create_xml_metadata(output_dir, artist, album, track_num, title, album_id=None, artist_id=None):
+    try:
+        sanitized_title = sanitize_filename(title)
+        filename = f"{track_num:02d} - {sanitized_title}.xml"
+        file_path = os.path.join(output_dir, filename)
+        mb_album = f"  <musicbrainzalbumid>{album_id}</musicbrainzalbumid>\n" if album_id else ""
+        mb_artist = f"  <musicbrainzartistid>{artist_id}</musicbrainzartistid>\n" if artist_id else ""
+        content = f"""<song>
+  <title>{title}</title>
+  <artist>{artist}</artist>
+  <performingartist>{artist}</performingartist>
+  <albumartist>{artist}</albumartist>
+  <album>{album}</album>
+{mb_album}{mb_artist}</song>"""
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True
+    except:
         return False
 
 def process_album_download(album_id):
-    if download_process['active']:
-        return {'error': 'Download already in progress'}
-    
+    if download_process['active']: return {'error': 'Busy'}
     download_process['active'] = True
     download_process['stop'] = False
     download_process['progress'] = {}
+    download_process['album_id'] = album_id
     
     try:
-        print(f"DEBUG: Downloading album ID {album_id}")
         album = lidarr_request(f'album/{album_id}')
-        if 'error' in album:
-            print(f"DEBUG: Error getting album: {album['error']}")
-            return album
-        
-        print(f"DEBUG: Got album: {album.get('title')}")
+        if 'error' in album: return album
         
         tracks = album.get('tracks', [])
         if not tracks:
-            print(f"DEBUG: No tracks found, trying track endpoint")
-            tracks_response = lidarr_request(f'track?albumId={album_id}')
-            if isinstance(tracks_response, list):
-                tracks = tracks_response
-                album['tracks'] = tracks
-        
-        print(f"DEBUG: Album has {len(tracks)} tracks")
-        
+            tracks = get_itunes_tracks(album['artist']['artistName'], album['title'])
+            album['tracks'] = tracks
+
         artist_name = album['artist']['artistName']
+        artist_id = album['artist']['id']
+        artist_mbid = album['artist'].get('foreignArtistId', '')
         album_title = album['title']
+        release = album.get('releases', [{}])[0]
+        album_mbid = release.get('foreignReleaseId', '')
+        release_year = str(album.get('releaseDate', ''))[:4]
+
+        sanitized_artist = sanitize_filename(artist_name)
+        sanitized_album = sanitize_filename(album_title)
         
-        root_folders = lidarr_request('rootFolder')
-        if not root_folders or isinstance(root_folders, dict):
-            return {'error': 'No root folder configured'}
-        
-        root_path = root_folders[0]['path']
-        sanitized_artist = "".join(c for c in artist_name if c.isalnum() or c in (' ', '-', '_')).strip()
-        sanitized_album = "".join(c for c in album_title if c.isalnum() or c in (' ', '-', '_')).strip()
-        
-        artist_path = os.path.join(root_path, sanitized_artist)
-        album_path = os.path.join(artist_path, sanitized_album)
+        artist_path = os.path.join(DOWNLOAD_DIR, sanitized_artist)
+        album_folder_name = f"{sanitized_album} ({release_year})" if release_year else sanitized_album
+        album_path = os.path.join(artist_path, album_folder_name)
         os.makedirs(album_path, exist_ok=True)
-        
-        print(f"DEBUG: Download path: {album_path}")
-        
+
         cover_data = get_itunes_artwork(artist_name, album_title)
-        if not cover_data and album.get('images'):
-            for img in album['images']:
-                if img['coverType'] == 'cover':
-                    try:
-                        cover_data = requests.get(img['remoteUrl'], timeout=15).content
-                        break
-                    except:
-                        pass
-        
         if cover_data:
             with open(os.path.join(album_path, 'cover.jpg'), 'wb') as f:
                 f.write(cover_data)
-        
-        tracks_to_download = [t for t in tracks if not t.get('hasFile')]
-        print(f"DEBUG: {len(tracks_to_download)} tracks to download")
-        
+
+        # Filtra le canzoni: scarica solo se 'hasFile' è False (cioè la canzone manca in Lidarr)
+        tracks_to_download = [t for t in tracks if not t.get('hasFile', False)]
+        print(f"DEBUG: Downloading {len(tracks_to_download)} tracks out of {len(tracks)} total")
+
         for idx, track in enumerate(tracks_to_download, 1):
-            if download_process['stop']:
-                return {'stopped': True}
+            if download_process['stop']: return {'stopped': True}
             
             track_title = track['title']
-            try:
-                track_num = int(track.get('trackNumber', idx))
-            except (ValueError, TypeError):
-                track_num = idx
+            track_num = int(track.get('trackNumber', 0)) or idx
+            query = f"{artist_name} {track_title} official audio"
+            sanitized_track = sanitize_filename(track_title)
             
-            print(f"DEBUG: Downloading track {idx}/{len(tracks_to_download)}: {track_title}")
-            
-            query = f"{artist_name} {album_title} {track_title}"
-            sanitized_track = "".join(c for c in track_title if c.isalnum() or c in (' ', '-', '_')).strip()
             temp_file = os.path.join(album_path, f"temp_{track_num:02d}")
             final_file = os.path.join(album_path, f"{track_num:02d} - {sanitized_track}.mp3")
             
-            try:
-                download_track_youtube(query, temp_file)
-                actual_file = temp_file + '.mp3'
-                
-                if os.path.exists(actual_file):
-                    time.sleep(1)
-                    tag_mp3(actual_file, track, album, cover_data)
-                    shutil.move(actual_file, final_file)
-                    print(f"DEBUG: Downloaded: {final_file}")
-                
-                download_process['progress'] = {'current': idx, 'total': len(tracks_to_download)}
-            except Exception as e:
-                print(f"DEBUG: Error downloading track: {e}")
-                continue
-        
-        print(f"DEBUG: Triggering Lidarr rescan on artist folder: {artist_path}")
-        lidarr_request('command', method='POST', data={'name': 'RescanFolders', 'folders': [artist_path]})
-        
+            download_track_youtube(query, temp_file, track_title)
+            actual_file = temp_file + '.mp3'
+            
+            if os.path.exists(actual_file):
+                time.sleep(0.5)
+                tag_mp3(actual_file, track, album, cover_data)
+                create_xml_metadata(album_path, artist_name, album_title, track_num, track_title, album_mbid, artist_mbid)
+                shutil.move(actual_file, final_file)
+            
+            download_process['progress'] = {'current': idx, 'total': len(tracks_to_download)}
+
+        set_permissions(artist_path)
+        lidarr_request('command', method='POST', data={'name': 'DownloadedAlbumsScan', 'path': album_path, 'importMode': 'Auto'})
+        lidarr_request('command', method='POST', data={'name': 'RefreshArtist', 'artistId': artist_id})
         send_telegram(f"✅ Album downloaded: {artist_name} - {album_title}")
-        
-        return {'success': True, 'album_path': album_path}
+        return {'success': True}
     except Exception as e:
-        print(f"DEBUG: Exception in download: {e}")
-        import traceback
-        traceback.print_exc()
         return {'error': str(e)}
     finally:
         download_process['active'] = False
         download_process['progress'] = {}
+        download_process['album_id'] = None
 
+# Routes
 @app.route('/api/test-connection')
 def api_test_connection():
-    config = load_config()
-    if not config.get('lidarr_url') or not config.get('lidarr_api_key'):
-        return jsonify({'error': 'Configuration missing', 'status': 'error'})
-    
     try:
         system = lidarr_request('system/status')
-        if 'error' in system:
-            return jsonify({'error': system['error'], 'status': 'error'})
-        
-        wanted = lidarr_request('wanted/missing?pageSize=5')
-        album_count = lidarr_request('album')
-        
-        return jsonify({
-            'status': 'success',
-            'lidarr_version': system.get('version', 'unknown'),
-            'total_albums': len(album_count) if isinstance(album_count, list) else 0,
-            'wanted_endpoint': 'available' if isinstance(wanted, dict) and 'records' in wanted else 'unavailable',
-            'missing_count': wanted.get('totalRecords', 0) if isinstance(wanted, dict) else 0
-        })
-    except Exception as e:
-        return jsonify({'error': str(e), 'status': 'error'})
+        return jsonify({'status': 'success' if 'version' in system else 'error', 'lidarr_version': system.get('version', 'Unknown')})
+    except:
+        return jsonify({'status': 'error'})
 
 @app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/metadata')
-def metadata():
-    return render_template('metadata.html')
+def index(): return render_template('index.html')
 
 @app.route('/scheduler')
-def scheduler():
-    return render_template('scheduler.html')
+def scheduler(): return render_template('scheduler.html')
+
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory(os.path.join(app.root_path, 'static'), 'favicon.ico', mimetype='image/vnd.microsoft.icon')
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def api_config():
-    if request.method == 'GET':
-        return jsonify(load_config())
-    else:
-        config = request.json
-        save_config(config)
-        return jsonify({'success': True})
+    if request.method == 'GET': return jsonify(load_config())
+    else: save_config(request.json); return jsonify({'success': True})
 
 @app.route('/api/missing-albums')
-def api_missing_albums():
-    print("Fetching missing albums...")
-    albums = get_missing_albums()
-    print(f"Found {len(albums)} missing albums")
-    return jsonify(albums)
+def api_missing_albums(): return jsonify(get_missing_albums())
 
 @app.route('/api/album/<int:album_id>')
 def api_album_details(album_id):
     album = lidarr_request(f'album/{album_id}')
+    if not album.get('tracks'):
+        album['tracks'] = get_itunes_tracks(album['artist']['artistName'], album['title'])
     return jsonify(album)
-
-@app.route('/api/preview/<int:album_id>/<int:track_number>')
-def api_preview(album_id, track_number):
-    album = lidarr_request(f'album/{album_id}')
-    if 'error' in album:
-        return jsonify({'error': 'Album not found'})
-    
-    track = next((t for t in album.get('tracks', []) if t['trackNumber'] == track_number), None)
-    if not track:
-        return jsonify({'error': 'Track not found'})
-    
-    preview_url = get_itunes_preview(album['artist']['artistName'], track['title'])
-    return jsonify({'previewUrl': preview_url})
 
 @app.route('/api/download/<int:album_id>', methods=['POST'])
 def api_download(album_id):
-    thread = threading.Thread(target=process_album_download, args=(album_id,))
-    thread.start()
+    threading.Thread(target=process_album_download, args=(album_id,)).start()
     return jsonify({'success': True})
 
 @app.route('/api/download/stop', methods=['POST'])
@@ -388,95 +372,7 @@ def api_download_stop():
     return jsonify({'success': True})
 
 @app.route('/api/download/status')
-def api_download_status():
-    return jsonify({
-        'active': download_process['active'],
-        'progress': download_process['progress']
-    })
-
-@app.route('/api/artists')
-def api_artists():
-    root_folders = lidarr_request('rootFolder')
-    if not root_folders or isinstance(root_folders, dict):
-        return jsonify([])
-    
-    root_path = root_folders[0]['path']
-    if not os.path.exists(root_path):
-        return jsonify([])
-    
-    artists = []
-    for artist_dir in os.listdir(root_path):
-        full_path = os.path.join(root_path, artist_dir)
-        if os.path.isdir(full_path):
-            albums = []
-            for album_dir in os.listdir(full_path):
-                album_path = os.path.join(full_path, album_dir)
-                if os.path.isdir(album_path):
-                    albums.append({'name': album_dir, 'path': album_path})
-            if albums:
-                artists.append({'name': artist_dir, 'albums': albums})
-    
-    return jsonify(artists)
-
-@app.route('/api/metadata/download', methods=['POST'])
-def api_metadata_download():
-    data = request.json
-    artist_name = data['artist']
-    album_path = data['path']
-    
-    try:
-        os.makedirs(album_path, exist_ok=True)
-        
-        assets = {
-            'logo.png': f"{artist_name} logo transparent png",
-            'fanart.jpg': f"{artist_name} concert stage wallpaper hd",
-            'banner.jpg': f"{artist_name} banner header",
-            'poster.jpg': f"{artist_name} poster artwork"
-        }
-        
-        for filename, query in assets.items():
-            file_path = os.path.join(album_path, filename)
-            if not os.path.exists(file_path):
-                try:
-                    downloader.download(query, limit=1, output_dir=album_path, adult_filter_off=True, force_replace=False, timeout=15, verbose=False)
-                    downloaded = os.path.join(album_path, query)
-                    if os.path.exists(downloaded):
-                        files = os.listdir(downloaded)
-                        if files:
-                            shutil.move(os.path.join(downloaded, files[0]), file_path)
-                        shutil.rmtree(downloaded)
-                except:
-                    pass
-        
-        nfo_path = os.path.join(os.path.dirname(album_path), 'artist.nfo')
-        if not os.path.exists(nfo_path):
-            nfo_content = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<artist>
-    <name>{artist_name}</name>
-</artist>"""
-            with open(nfo_path, 'w', encoding='utf-8') as f:
-                f.write(nfo_content)
-        
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'error': str(e)})
-
-def scheduled_check():
-    albums = get_missing_albums()
-    if albums:
-        send_telegram(f"🔍 Found {len(albums)} missing albums")
-
-def run_scheduler():
-    while True:
-        schedule.run_pending()
-        time.sleep(10)
-
-def setup_scheduler():
-    config = load_config()
-    schedule.clear()
-    if config.get('scheduler_enabled'):
-        interval = config.get('scheduler_interval', 60)
-        schedule.every(interval).minutes.do(scheduled_check)
+def api_download_status(): return jsonify(download_process)
 
 @app.route('/api/scheduler/toggle', methods=['POST'])
 def api_scheduler_toggle():
@@ -486,8 +382,19 @@ def api_scheduler_toggle():
     setup_scheduler()
     return jsonify({'enabled': config['scheduler_enabled']})
 
+def scheduled_check():
+    if get_missing_albums(): send_telegram("🔍 Found missing albums")
+
+def run_scheduler():
+    while True: schedule.run_pending(); time.sleep(10)
+
+def setup_scheduler():
+    config = load_config()
+    schedule.clear()
+    if config.get('scheduler_enabled'):
+        schedule.every(config.get('scheduler_interval', 60)).minutes.do(scheduled_check)
+
 if __name__ == '__main__':
     setup_scheduler()
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
+    threading.Thread(target=run_scheduler, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, debug=False)
